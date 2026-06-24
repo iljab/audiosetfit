@@ -1,0 +1,12 @@
+# Core runtime dependencies for audiosetfit.
+# Installed automatically via `pip install -e .`, but kept here for convenience.
+torch>=2.1
+transformers>=4.40
+datasets>=2.18
+scikit-learn>=1.3
+numpy>=1.24
+librosa>=0.10
+soundfile>=0.12
+torchcodec>=0.4  # required by datasets>=4 for audio decoding (needs FFmpeg installed)
+tqdm>=4.65
+huggingface_hub>=0.23
