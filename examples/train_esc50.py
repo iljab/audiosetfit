@@ -48,9 +48,7 @@ def main():
     ds = ds.filter(lambda c: c in selected, input_columns="category")
 
     model = AudioSetFitModel.from_pretrained(
-        #args.backbone,
-        "/Users/iljabaumann/Downloads/BEATs_iter3.pt",
-        encoder_type="beats",
+        args.backbone,
         labels=selected,
         use_differentiable_head=args.differentiable_head,
         device=args.device,
