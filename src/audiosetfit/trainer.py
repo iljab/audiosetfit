@@ -37,6 +37,27 @@ class _PairDataset(Dataset):
         return self.waveforms[pair["idx_1"]], self.waveforms[pair["idx_2"]], float(pair["label"])
 
 
+class _PairCollator:
+    """Top-level (picklable) collate fn that runs the encoder's feature extraction on a batch.
+
+    It holds only the audio encoder *body* — not the `Trainer`, its datasets, or the head — so
+    that with ``num_workers > 0`` the `DataLoader` doesn't try to pickle the whole training
+    state. Note: under the ``spawn`` start method (macOS/Windows) the body is still serialized
+    to each worker, so prefer ``num_workers=0`` for large backbones there; on Linux (``fork``)
+    workers share memory and ``num_workers > 0`` is cheap.
+    """
+
+    def __init__(self, encoder) -> None:
+        self.encoder = encoder
+
+    def __call__(self, batch):
+        waves_a, waves_b, labels = zip(*batch)
+        inputs_a = self.encoder.prepare(list(waves_a))
+        inputs_b = self.encoder.prepare(list(waves_b))
+        labels = torch.tensor(labels, dtype=torch.float32)
+        return inputs_a, inputs_b, labels
+
+
 class Trainer:
     """Trainer to fit an `AudioSetFitModel` from few labeled audio examples."""
 
@@ -126,7 +147,7 @@ class Trainer:
             batch_size=args.embedding_batch_size,
             shuffle=True,
             num_workers=args.num_workers,
-            collate_fn=self._collate_pairs,
+            collate_fn=_PairCollator(self.model.model_body),
         )
 
         loss_fn = get_loss(args.loss)
@@ -179,13 +200,6 @@ class Trainer:
                 break
 
         body.eval()
-
-    def _collate_pairs(self, batch):
-        waves_a, waves_b, labels = zip(*batch)
-        inputs_a = self.model.model_body.prepare(list(waves_a))
-        inputs_b = self.model.model_body.prepare(list(waves_b))
-        labels = torch.tensor(labels, dtype=torch.float32)
-        return inputs_a, inputs_b, labels
 
     def _build_scheduler(self, optimizer, total_steps: int, warmup_proportion: float):
         warmup_steps = int(max(total_steps, 1) * warmup_proportion)

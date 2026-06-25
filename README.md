@@ -41,9 +41,16 @@ on NVIDIA GPUs it uses CUDA; otherwise CPU.
 > (4–7) installed on your system. On macOS: `brew install ffmpeg`; on Debian/Ubuntu:
 > `sudo apt-get install ffmpeg`.
 
-## Quickstart: few-shot ESC-50
+## Examples
 
-ESC-50 (2,000 environmental-sound clips, 50 classes) is the small default starting point. The example restricts to a few classes for a fast first run:
+The `examples/` scripts cover four small benchmarks across different audio domains. They share
+the same CLI flags (`--backbone`, `--classes`, `--num-samples`, `--epochs`, `--max-pairs`,
+`--no-embedding-finetuning`, `--differentiable-head`, `--num-workers`, ...).
+
+### ESC-50 (environmental sounds)
+
+[ESC-50](https://huggingface.co/datasets/ashraq/esc50) (2,000 clips, 50 classes) is the small
+default starting point. The example restricts to a few classes for a fast first run:
 
 ```bash
 python examples/train_esc50.py                      # 5 classes, 8 shots, CLAP
@@ -51,7 +58,44 @@ python examples/train_esc50.py --classes 10 --num-samples 16
 python examples/train_esc50.py --no-embedding-finetuning   # frozen-backbone baseline
 ```
 
-Minimal end-to-end usage:
+### UrbanSound8K (urban sounds)
+
+[UrbanSound8K](https://huggingface.co/datasets/danavery/urbansound8K) (8,732 clips, 10 classes,
+10 folds) follows the dataset's fold protocol (folds 1-9 train, fold 10 test):
+
+```bash
+python examples/train_urbansound8k.py               # 5 classes, 8 shots, CLAP
+python examples/train_urbansound8k.py --classes 10 --num-samples 16
+```
+
+### CREMA-D (speech emotion)
+
+A **speech** task where self-supervised speech encoders shine:
+[CREMA-D](https://huggingface.co/datasets/confit/cremad-parquet) (7,442 clips, 91 actors,
+6 emotions). It defaults to `facebook/wav2vec2-base` and uses a *speaker-disjoint* train/test split:
+
+```bash
+python examples/train_cremad.py                         # wav2vec2-base
+python examples/train_cremad.py --backbone microsoft/wavlm-base
+python examples/train_cremad.py --backbone facebook/hubert-base-ls960
+python examples/train_cremad.py --backbone laion/clap-htsat-unfused   # compare vs CLAP
+```
+
+### MSWC (keyword spotting)
+
+A **keyword-spotting** example (SUPERB KS-style) on
+[MSWC](https://huggingface.co/datasets/confit/mswc-parquet) (Multilingual Spoken Words Corpus).
+Each clip is a single spoken word; this is a lexical/phonetic task, so it also defaults to a
+speech encoder and uses the dataset's predefined train/test splits:
+
+```bash
+python examples/train_mswc_keywords.py                  # 10 keywords, wav2vec2-base
+python examples/train_mswc_keywords.py --classes 5 --num-samples 16
+python examples/train_mswc_keywords.py --language spanish
+python examples/train_mswc_keywords.py --backbone laion/clap-htsat-unfused   # compare vs CLAP
+```
+
+### Minimal end-to-end usage
 
 ```python
 from datasets import Audio, load_dataset
@@ -64,7 +108,7 @@ train_ds = sample_dataset(ds, label_column="category", num_samples=8)
 model = AudioSetFitModel.from_pretrained("laion/clap-htsat-unfused", labels=labels)
 trainer = Trainer(
     model=model,
-    args=TrainingArguments(embedding_num_epochs=1, max_steps=60),
+    args=TrainingArguments(embedding_num_epochs=1, max_pairs=256),
     train_dataset=train_ds,
     column_mapping={"category": "label"},  # the 'audio' column already matches
 )
@@ -85,13 +129,6 @@ reloaded = AudioSetFitModel.from_pretrained("my-esc50-model")
 
 Everything is resampled to the backbone's expected rate (CLAP = 48 kHz).
 
-## Why CLAP as the default backbone?
-
-[CLAP](https://huggingface.co/laion/clap-htsat-unfused) (Contrastive Language-Audio
-Pretraining) is the closest audio analog to a sentence-transformer: it was *already* trained
-contrastively, producing a 512-d projection space where semantically similar sounds are close
-together. That makes it an excellent starting point for few-shot contrastive fine-tuning and
-even the frozen-backbone baseline (`--no-embedding-finetuning`) is strong.
 
 ## Project layout
 
@@ -105,6 +142,9 @@ src/audiosetfit/
 ├── training_args.py # TrainingArguments (both phases)
 └── trainer.py       # self-contained two-phase Trainer
 examples/train_esc50.py
+examples/train_urbansound8k.py
+examples/train_cremad.py
+examples/train_mswc_keywords.py
 ```
 
 ## Key training arguments
@@ -179,11 +219,8 @@ encoders._ENCODER_REGISTRY["my_model_type"] = MyEncoder
 
 ## Roadmap / next steps
 
-- (Optional) BEATs / OpenBEATs backbone: strongest general-purpose SSL audio embeddings;
-needs external modeling code + a manually downloaded checkpoint, so deferred for now.
 - `SupConLoss` + group-by-label batch sampler (as in SetFit).
 - Multilabel audio tagging end-to-end example.
-- Other dataset examples: e.g., Speech Commands example.
 - ONNX export and Hub `push_to_hub`.
 
 ## Acknowledgements
