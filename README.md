@@ -95,6 +95,26 @@ python examples/train_mswc_keywords.py --language spanish
 python examples/train_mswc_keywords.py --backbone laion/clap-htsat-unfused   # compare vs CLAP
 ```
 
+### Benchmarking (multi-backbone / multi-seed)
+
+`examples/benchmark.py` drives the training scripts above across a grid of backbones x seeds and
+prints a mean +/- std table, so backbone comparisons are reproducible instead of single noisy runs.
+It reuses each dataset's own split logic. `Trainer.evaluate` reports both accuracy and macro-F1,
+and `Trainer.classification_report(...)` adds per-class accuracy and a confusion matrix.
+
+```bash
+# CLAP vs wav2vec2 on CREMA-D over 3 seeds
+python examples/benchmark.py --dataset cremad \
+    --backbones laion/clap-htsat-unfused facebook/wav2vec2-base --seeds 41 42 43
+
+# Keyword spotting with speech encoders, write a CSV of every run
+python examples/benchmark.py --dataset mswc \
+    --backbones facebook/wav2vec2-base microsoft/wavlm-base --seeds 42 43 --csv results.csv
+
+# Forward extra flags to the training script after a literal `--`
+python examples/benchmark.py --dataset esc50 --seeds 41 42 43 -- --no-embedding-finetuning
+```
+
 ### Minimal end-to-end usage
 
 ```python
@@ -145,6 +165,7 @@ examples/train_esc50.py
 examples/train_urbansound8k.py
 examples/train_cremad.py
 examples/train_mswc_keywords.py
+examples/benchmark.py            # multi-backbone / multi-seed harness
 ```
 
 ## Key training arguments
@@ -219,9 +240,26 @@ encoders._ENCODER_REGISTRY["my_model_type"] = MyEncoder
 
 ## Roadmap / next steps
 
-- `SupConLoss` + group-by-label batch sampler (as in SetFit).
-- Multilabel audio tagging end-to-end example.
-- ONNX export and Hub `push_to_hub`.
+**Benchmarking & evaluation**
+- [x] Reproducible multi-backbone / multi-seed benchmark harness (`examples/benchmark.py`) with mean ± std tables.
+- [x] Richer metrics in `Trainer.evaluate` (accuracy + macro-F1); per-class accuracy and confusion matrix via `Trainer.classification_report`.
+- [ ] Published results table (CLAP vs wav2vec2 vs WavLM across all example datasets).
+
+**Training method**
+- [ ] `SupConLoss` / InfoNCE with in-batch negatives + group-by-label batch sampler (so larger batches add real negatives, as in SetFit).
+- [ ] Audio augmentation for the few-shot regime (SpecAugment, additive noise, gain, time-shift, random crop).
+- [ ] Embedding cache for the frozen-backbone path (skip re-encoding clips across runs/sweeps).
+- [ ] Knowledge distillation from a large unlabeled audio pool (teacher → student).
+
+**Models & inputs**
+- [ ] Long-clip handling: windowing/chunking → encode → pool/vote.
+- [ ] Multilabel audio tagging end-to-end example (sampler already supports multilabel pairs).
+- [ ] (Optional) BEATs / OpenBEATs backbone (strongest general-purpose SSL embeddings).
+
+**Productionization**
+- [ ] ONNX / `torch.compile` export for fast CPU inference.
+- [ ] Hub `push_to_hub` with an auto-generated model card (incl. the eval table).
+- [ ] Smoke-test suite + CI using small real models (e.g. `openai/whisper-tiny`).
 
 ## Acknowledgements
 

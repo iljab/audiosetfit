@@ -223,27 +223,60 @@ class Trainer:
 
     # ------------------------------------------------------------------ evaluation
     @torch.no_grad()
-    def evaluate(self, dataset=None, metric_key_prefix: str = "test") -> Dict[str, float]:
+    def _predict_true(self, dataset=None):
+        """Return ``(y_true, y_pred)`` as encoded-int numpy arrays over an eval dataset."""
         dataset = self._apply_column_mapping(dataset) if dataset is not None else self.eval_dataset
         if dataset is None:
             raise ValueError("No evaluation dataset provided.")
         x_test, y_test = self._dataset_to_xy(dataset)
-        y_true = self._encode_labels(y_test)
+        y_true = np.asarray(self._encode_labels(y_test))
+        y_pred = np.asarray(
+            self.model.predict(x_test, use_labels=False, show_progress_bar=self.args.show_progress_bar)
+        )
+        return y_true, y_pred
 
-        y_pred = self.model.predict(x_test, use_labels=False, show_progress_bar=self.args.show_progress_bar)
-        y_pred = np.asarray(y_pred)
+    @torch.no_grad()
+    def evaluate(self, dataset=None, metric_key_prefix: str = "test") -> Dict[str, float]:
+        y_true, y_pred = self._predict_true(dataset)
 
         if callable(self.metric):
-            results = self.metric(y_pred, np.asarray(y_true))
+            results = self.metric(y_pred, y_true)
             return results if isinstance(results, dict) else {f"{metric_key_prefix}_metric": results}
 
         from sklearn.metrics import accuracy_score, f1_score
 
-        if self.metric == "accuracy":
-            return {f"{metric_key_prefix}_accuracy": float(accuracy_score(y_true, y_pred))}
-        if self.metric == "f1":
-            return {f"{metric_key_prefix}_f1": float(f1_score(y_true, y_pred, average="macro"))}
+        if self.metric in ("accuracy", "f1"):
+            # Report both so a single run is informative regardless of the requested metric.
+            return {
+                f"{metric_key_prefix}_accuracy": float(accuracy_score(y_true, y_pred)),
+                f"{metric_key_prefix}_f1_macro": float(f1_score(y_true, y_pred, average="macro")),
+            }
         raise ValueError(f"Unknown metric {self.metric!r}. Use 'accuracy', 'f1', or a callable.")
+
+    @torch.no_grad()
+    def classification_report(self, dataset=None) -> Dict[str, Any]:
+        """Detailed report: overall accuracy/macro-F1, per-class accuracy, and confusion matrix.
+
+        The confusion matrix is row=true, col=pred, indexed by ``model.labels`` order.
+        """
+        from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+
+        y_true, y_pred = self._predict_true(dataset)
+        labels = self.model.labels
+        n = len(labels) if labels is not None else int(max(y_true.max(), y_pred.max(), 0)) + 1
+        cm = confusion_matrix(y_true, y_pred, labels=list(range(n)))
+        row_totals = cm.sum(axis=1)
+        names = list(labels) if labels is not None else list(range(n))
+        per_class_acc = {
+            names[i]: (float(cm[i, i] / row_totals[i]) if row_totals[i] else 0.0) for i in range(n)
+        }
+        return {
+            "accuracy": float(accuracy_score(y_true, y_pred)),
+            "f1_macro": float(f1_score(y_true, y_pred, average="macro")),
+            "per_class_accuracy": per_class_acc,
+            "labels": names,
+            "confusion_matrix": cm.tolist(),
+        }
 
     def push_to_hub(self, repo_id: str, **kwargs) -> str:
         raise NotImplementedError(
