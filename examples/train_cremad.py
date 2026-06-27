@@ -9,8 +9,14 @@ To keep evaluation honest, the train/test split is *speaker-disjoint*: a fractio
 is held out entirely for testing, so the model is scored on voices it never heard during the
 few-shot fit. The speaker id is the first token of each filename (e.g. ``1068_TIE_ANG_XX.wav``).
 
+Backbone choice dominates here: a generic SSL model (wav2vec2/HuBERT/WavLM-base) only reaches
+~0.3 accuracy at 8 shots, while a backbone already *task-pretrained* for emotion roughly doubles
+that (e.g. ``Hatman/audio-emotion-detection``, a wav2vec2-xlsr-53 fine-tuned on Common Voice -- not
+CREMA-D, so it is a fair cross-corpus transfer). Contrastive fine-tuning then adds a smaller bump.
+
 Examples:
     python examples/train_cremad.py                              # wav2vec2-base, 8 shots/emotion
+    python examples/train_cremad.py --backbone Hatman/audio-emotion-detection   # emotion-pretrained (best)
     python examples/train_cremad.py --backbone microsoft/wavlm-base
     python examples/train_cremad.py --backbone facebook/hubert-base-ls960
     python examples/train_cremad.py --backbone laion/clap-htsat-unfused   # compare vs CLAP
