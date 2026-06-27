@@ -7,6 +7,8 @@ Phase 2 — classifier head: fits the head on embeddings of the training example
 
 from __future__ import annotations
 
+import random
+from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
@@ -56,6 +58,74 @@ class _PairCollator:
         inputs_b = self.encoder.prepare(list(waves_b))
         labels = torch.tensor(labels, dtype=torch.float32)
         return inputs_a, inputs_b, labels
+
+
+class _SampleDataset(Dataset):
+    """Map-style dataset over single (waveform, int-label) examples for the in-batch loss path."""
+
+    def __init__(self, waveforms: List[np.ndarray], labels: List[int]) -> None:
+        self.waveforms = waveforms
+        self.labels = labels
+
+    def __len__(self) -> int:
+        return len(self.waveforms)
+
+    def __getitem__(self, idx: int):
+        return self.waveforms[idx], int(self.labels[idx])
+
+
+class _SampleCollator:
+    """Top-level (picklable) collate fn that feature-extracts a batch of single examples."""
+
+    def __init__(self, encoder) -> None:
+        self.encoder = encoder
+
+    def __call__(self, batch):
+        waves, labels = zip(*batch)
+        inputs = self.encoder.prepare(list(waves))
+        labels = torch.tensor(labels, dtype=torch.long)
+        return inputs, labels
+
+
+class _GroupByLabelBatchSampler:
+    """Yields index batches of ``num_classes_per_batch`` classes x ``samples_per_class`` examples.
+
+    Guarantees each batch contains in-batch positives (>=2 per class) and negatives (>=2 classes),
+    which is what makes a supervised-contrastive loss meaningful. Classes with too few examples
+    are sampled with replacement so the few-shot regime still works.
+    """
+
+    def __init__(
+        self,
+        labels: List[int],
+        num_classes_per_batch: int,
+        samples_per_class: int,
+        num_batches: int,
+        seed: int = 42,
+    ) -> None:
+        self.label_to_indices: Dict[int, List[int]] = defaultdict(list)
+        for i, y in enumerate(labels):
+            self.label_to_indices[int(y)].append(i)
+        self.classes = list(self.label_to_indices)
+        self.num_classes_per_batch = max(2, min(num_classes_per_batch, len(self.classes)))
+        self.samples_per_class = max(2, samples_per_class)
+        self.num_batches = max(1, num_batches)
+        self.rng = random.Random(seed)
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+    def __iter__(self):
+        for _ in range(self.num_batches):
+            chosen = self.rng.sample(self.classes, self.num_classes_per_batch)
+            batch: List[int] = []
+            for c in chosen:
+                idxs = self.label_to_indices[c]
+                if len(idxs) >= self.samples_per_class:
+                    batch.extend(self.rng.sample(idxs, self.samples_per_class))
+                else:
+                    batch.extend(self.rng.choice(idxs) for _ in range(self.samples_per_class))
+            yield batch
 
 
 class Trainer:
@@ -128,35 +198,25 @@ class Trainer:
         self.model.unfreeze("body")
         body.train()
 
-        max_pairs = args.max_pairs
-        if max_pairs == -1 and args.max_steps != -1:
-            max_pairs = args.max_steps * args.embedding_batch_size
-
-        contrastive = ContrastiveDataset(
-            labels=y_train,
-            multilabel=self.model.multi_target_strategy is not None,
-            num_iterations=args.num_iterations,
-            sampling_strategy=args.sampling_strategy,
-            max_pairs=max_pairs,
-        )
-        pairs = list(contrastive)
-        waveforms = load_audio_batch(x_train, body.target_sr)
-        dataset = _PairDataset(pairs, waveforms)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=args.embedding_batch_size,
-            shuffle=True,
-            num_workers=args.num_workers,
-            collate_fn=_PairCollator(self.model.model_body),
-        )
-
         loss_fn = get_loss(args.loss)
         if hasattr(loss_fn, "margin"):
             try:
                 loss_fn.margin = args.margin
             except Exception:
                 pass
+        if hasattr(loss_fn, "temperature"):
+            try:
+                loss_fn.temperature = args.supcon_temperature
+            except Exception:
+                pass
         loss_fn.to(self.model.device)
+
+        waveforms = load_audio_batch(x_train, body.target_sr)
+        in_batch = getattr(loss_fn, "in_batch", False)
+        if in_batch:
+            dataloader, data_desc = self._build_supcon_loader(waveforms, y_train, args)
+        else:
+            dataloader, data_desc = self._build_pair_loader(waveforms, y_train, args)
 
         params = [p for p in body.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(params, lr=args.body_learning_rate, weight_decay=args.l2_weight)
@@ -170,27 +230,34 @@ class Trainer:
         use_amp = args.use_amp and self.model.device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-        print(f"***** Embedding fine-tuning *****")
-        print(f"  Num pairs        = {len(pairs)}")
+        print("***** Embedding fine-tuning *****")
+        print(f"  Loss             = {type(loss_fn).__name__}")
+        print(f"  {data_desc}")
         print(f"  Batch size       = {args.embedding_batch_size}")
         print(f"  Epochs           = {args.embedding_num_epochs}")
         print(f"  Total optim steps= {total_steps}")
 
         global_step = 0
         for _ in trange(args.embedding_num_epochs, desc="Embedding epoch", disable=not args.show_progress_bar):
-            for batch in tqdm(dataloader, desc="Pairs", leave=False, disable=not args.show_progress_bar):
+            for batch in tqdm(dataloader, desc="Steps", leave=False, disable=not args.show_progress_bar):
                 if args.max_steps != -1 and global_step >= args.max_steps:
                     break
-                inputs_a, inputs_b, labels = batch
-                inputs_a = {k: v.to(self.model.device) for k, v in inputs_a.items()}
-                inputs_b = {k: v.to(self.model.device) for k, v in inputs_b.items()}
-                labels = labels.to(self.model.device)
-
                 optimizer.zero_grad()
                 with torch.autocast(device_type=self.model.device.type, enabled=use_amp):
-                    emb_a = body.forward_features(inputs_a)
-                    emb_b = body.forward_features(inputs_b)
-                    loss = loss_fn(emb_a, emb_b, labels)
+                    if in_batch:
+                        inputs, labels = batch
+                        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+                        labels = labels.to(self.model.device)
+                        emb = body.forward_features(inputs)
+                        loss = loss_fn(emb, labels)
+                    else:
+                        inputs_a, inputs_b, labels = batch
+                        inputs_a = {k: v.to(self.model.device) for k, v in inputs_a.items()}
+                        inputs_b = {k: v.to(self.model.device) for k, v in inputs_b.items()}
+                        labels = labels.to(self.model.device)
+                        emb_a = body.forward_features(inputs_a)
+                        emb_b = body.forward_features(inputs_b)
+                        loss = loss_fn(emb_a, emb_b, labels)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -200,6 +267,62 @@ class Trainer:
                 break
 
         body.eval()
+
+    def _build_pair_loader(self, waveforms: List[np.ndarray], y_train: List[int], args: TrainingArguments):
+        """Pairwise path: build same/different-label pairs (cosine / contrastive losses)."""
+        max_pairs = args.max_pairs
+        if max_pairs == -1 and args.max_steps != -1:
+            max_pairs = args.max_steps * args.embedding_batch_size
+
+        contrastive = ContrastiveDataset(
+            labels=y_train,
+            multilabel=self.model.multi_target_strategy is not None,
+            num_iterations=args.num_iterations,
+            sampling_strategy=args.sampling_strategy,
+            max_pairs=max_pairs,
+        )
+        pairs = list(contrastive)
+        dataset = _PairDataset(pairs, waveforms)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.embedding_batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=_PairCollator(self.model.model_body),
+        )
+        return dataloader, f"Num pairs        = {len(pairs)}"
+
+    def _build_supcon_loader(self, waveforms: List[np.ndarray], y_train: List[int], args: TrainingArguments):
+        """In-batch path: group-by-label batches so every batch has positives and negatives."""
+        samples_per_class = max(2, args.samples_per_class)
+        n_classes = len(set(int(y) for y in y_train))
+        num_classes_per_batch = max(2, min(args.embedding_batch_size // samples_per_class, n_classes))
+        effective_batch = num_classes_per_batch * samples_per_class
+
+        # Mirror the pairwise path's budget: reuse max_steps / max_pairs to size steps-per-epoch.
+        if args.max_steps != -1:
+            steps_per_epoch = args.max_steps
+        elif args.max_pairs != -1:
+            steps_per_epoch = max(1, args.max_pairs // effective_batch)
+        else:
+            steps_per_epoch = max(1, len(waveforms) // effective_batch)
+
+        sampler = _GroupByLabelBatchSampler(
+            labels=y_train,
+            num_classes_per_batch=num_classes_per_batch,
+            samples_per_class=samples_per_class,
+            num_batches=steps_per_epoch,
+            seed=args.seed,
+        )
+        dataset = _SampleDataset(waveforms, y_train)
+        dataloader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=args.num_workers,
+            collate_fn=_SampleCollator(self.model.model_body),
+        )
+        desc = f"Batches/epoch    = {steps_per_epoch} ({num_classes_per_batch} classes x {samples_per_class})"
+        return dataloader, desc
 
     def _build_scheduler(self, optimizer, total_steps: int, warmup_proportion: float):
         warmup_steps = int(max(total_steps, 1) * warmup_proportion)

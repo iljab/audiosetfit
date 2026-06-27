@@ -9,8 +9,14 @@ To keep evaluation honest, the train/test split is *speaker-disjoint*: a fractio
 is held out entirely for testing, so the model is scored on voices it never heard during the
 few-shot fit. The speaker id is the first token of each filename (e.g. ``1068_TIE_ANG_XX.wav``).
 
+Backbone choice dominates here: a generic SSL model (wav2vec2/HuBERT/WavLM-base) only reaches
+~0.3 accuracy at 8 shots, while a backbone already *task-pretrained* for emotion roughly doubles
+that (e.g. ``Hatman/audio-emotion-detection``, a wav2vec2-xlsr-53 fine-tuned on Common Voice -- not
+CREMA-D, so it is a fair cross-corpus transfer). Contrastive fine-tuning then adds a smaller bump.
+
 Examples:
     python examples/train_cremad.py                              # wav2vec2-base, 8 shots/emotion
+    python examples/train_cremad.py --backbone Hatman/audio-emotion-detection   # emotion-pretrained (best)
     python examples/train_cremad.py --backbone microsoft/wavlm-base
     python examples/train_cremad.py --backbone facebook/hubert-base-ls960
     python examples/train_cremad.py --backbone laion/clap-htsat-unfused   # compare vs CLAP
@@ -36,7 +42,7 @@ def parse_args():
     p.add_argument("--classes", type=int, default=6, help="Number of emotions to use (<=6)")
     p.add_argument("--num-samples", type=int, default=8, help="Labeled examples per class (few-shot)")
     p.add_argument("--epochs", type=int, default=1, help="Embedding fine-tuning epochs")
-    p.add_argument("--batch-size", type=int, default=8, help="Embedding (pair) batch size")
+    p.add_argument("--batch-size", type=int, default=32, help="Embedding (pair/group) batch size")
     p.add_argument("--max-steps", type=int, default=-1, help="Cap phase-1 optimizer steps (-1 = no cap)")
     p.add_argument("--eval-size", type=int, default=80, help="Max eval clips (for speed)")
     p.add_argument(
@@ -50,6 +56,8 @@ def parse_args():
     p.add_argument("--device", default=None, help="cpu / cuda / mps (auto if omitted)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-pairs", type=int, default=256, help="Cap total contrastive pairs (-1 = no cap)")
+    p.add_argument("--loss", default="supcon", help="Phase-1 loss: cosine / contrastive / supcon")
+    p.add_argument("--samples-per-class", type=int, default=2, help="Examples per class per batch (supcon path)")
     p.add_argument(
         "--num-workers",
         type=int,
@@ -110,7 +118,8 @@ def main():
         max_steps=args.max_steps,
         seed=args.seed,
         sampling_strategy="oversampling",
-        loss="cosine",
+        loss=args.loss,
+        samples_per_class=args.samples_per_class,
         num_workers=args.num_workers,
         max_pairs=args.max_pairs,
     )

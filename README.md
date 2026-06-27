@@ -85,14 +85,16 @@ python examples/train_cremad.py --backbone laion/clap-htsat-unfused   # compare 
 
 A **keyword-spotting** example (SUPERB KS-style) on
 [MSWC](https://huggingface.co/datasets/confit/mswc-parquet) (Multilingual Spoken Words Corpus).
-Each clip is a single spoken word; this is a lexical/phonetic task, so it also defaults to a
-speech encoder and uses the dataset's predefined train/test splits:
+Each clip is a single spoken word; this is a lexical/phonetic task, so it defaults to a speech
+encoder, the in-batch `supcon` loss, and the **most frequent** keywords (MSWC is long-tailed, so
+selecting alphabetically yields rare words with only 1-3 test clips and a misleading macro-F1):
 
 ```bash
-python examples/train_mswc_keywords.py                  # 10 keywords, wav2vec2-base
+python examples/train_mswc_keywords.py                  # 10 frequent keywords, wav2vec2-base, supcon
 python examples/train_mswc_keywords.py --classes 5 --num-samples 16
 python examples/train_mswc_keywords.py --language spanish
-python examples/train_mswc_keywords.py --backbone laion/clap-htsat-unfused   # compare vs CLAP
+python examples/train_mswc_keywords.py --keyword-selection alphabetical       # legacy selection
+python examples/train_mswc_keywords.py --backbone laion/clap-htsat-unfused    # compare vs CLAP
 ```
 
 ### Benchmarking (multi-backbone / multi-seed)
@@ -114,6 +116,43 @@ python examples/benchmark.py --dataset mswc \
 # Forward extra flags to the training script after a literal `--`
 python examples/benchmark.py --dataset esc50 --seeds 41 42 43 -- --no-embedding-finetuning
 ```
+
+### Benchmark results
+
+Mean over 3 seeds, 8 shots/class, sklearn head. `frozen` = no phase-1 fine-tuning; `cosine`/`supcon`
+are the best batch size found per dataset. Sound events use CLAP; keyword spotting uses WavLM;
+emotion uses a task-pretrained `wav2vec2-xlsr-53`. Reproduce with `bash examples/sweep.sh`.
+
+
+| Dataset                  | Backbone                  | Frozen (acc / F1) | Cosine (acc / F1)     | SupCon (acc / F1)     |
+| ------------------------ | ------------------------- | ----------------- | --------------------- | --------------------- |
+| **MSWC** (keyword)       | `wavlm-base-plus`         | 0.361 / 0.325     | 0.700 / 0.710         | **0.814** / **0.814** |
+| **CREMA-D** (emotion)    | `audio-emotion-detection` | 0.625 / 0.615     | **0.671** / **0.659** | 0.658 / 0.650         |
+| **ESC-50** (sound)       | `clap-htsat-unfused`      | 0.988 / 0.977     | 0.988 / 0.977         | **0.996** / **0.996** |
+| **UrbanSound8K** (sound) | `clap-htsat-unfused`      | 0.846 / 0.852     | **0.858** / **0.867** | 0.850 / 0.862         |
+
+
+Takeaways:
+
+- **Fine-tuning pays off where the frozen embedding has headroom and the backbone fits the task.**
+On MSWC, contrastive fine-tuning lifts accuracy from 0.36 -> **0.81** (+45 pts). On ESC-50, CLAP is
+already at ceiling (0.99), so there is nothing to gain.
+- **Backbone-task fit is the single biggest lever -- bigger than any loss or batch-size choice.**
+On CREMA-D, swapping a generic `wavlm-base` (frozen 0.29) for an emotion-pretrained
+`wav2vec2-xlsr-53` (`Hatman/audio-emotion-detection`, frozen 0.62) more than *doubles* accuracy.
+Contrastive fine-tuning then adds a smaller, consistent gain on top (0.62 -> 0.67). That model
+was fine-tuned on Common Voice, not CREMA-D, so this is honest cross-corpus transfer, not leakage.
+- `**supcon` is the strongest, most stable contrastive objective**, and it *improves with batch size*
+(more in-batch negatives): on MSWC, `supcon` accuracy rises 0.67 -> **0.81** going from batch 8 to 32,
+while its variance shrinks from +/-0.12 to +/-0.02. Pairwise `cosine` is weaker and noisier (0.70 at
+best). Hence the speech examples default to `--loss supcon --batch-size 32`.
+- **Accuracy and macro-F1 track each other once the eval set is well-populated.** An earlier MSWC run
+showed a large acc/F1 gap purely because keywords were picked *alphabetically* (rare proper nouns
+with 1-3 test clips each); the table above uses the default **most frequent** keywords
+(`--keyword-selection frequent`), and the two metrics now agree to within a point. (For genuinely
+imbalanced *training* pools, pass a class-weighted head via
+`from_pretrained(..., head_params={"class_weight": "balanced"})`; it is a no-op when training is
+already balanced by `sample_dataset`.)
 
 ### Minimal end-to-end usage
 
@@ -149,7 +188,6 @@ reloaded = AudioSetFitModel.from_pretrained("my-esc50-model")
 
 Everything is resampled to the backbone's expected rate (CLAP = 48 kHz).
 
-
 ## Project layout
 
 ```
@@ -157,7 +195,7 @@ src/audiosetfit/
 ├── encoders.py      # AudioEncoder base + CLAP/AST/wav2vec2-family/Whisper + build_encoder()
 ├── modeling.py      # AudioSetFitModel, AudioSetFitHead, save/from_pretrained
 ├── sampler.py       # ContrastiveDataset (same/different-label pair generation)
-├── losses.py        # CosineSimilarityLoss, ContrastiveLoss (on embedding tensors)
+├── losses.py        # CosineSimilarityLoss, ContrastiveLoss, SupConLoss (on embedding tensors)
 ├── data.py          # load_audio (resampling), sample_dataset
 ├── training_args.py # TrainingArguments (both phases)
 └── trainer.py       # self-contained two-phase Trainer
@@ -166,22 +204,32 @@ examples/train_urbansound8k.py
 examples/train_cremad.py
 examples/train_mswc_keywords.py
 examples/benchmark.py            # multi-backbone / multi-seed harness
+examples/sweep.sh                # full loss x batch-size x seed sweep across all datasets
 ```
 
 ## Key training arguments
 
 
-| Argument                  | Default          | Purpose                                                  |
-| ------------------------- | ---------------- | -------------------------------------------------------- |
-| `train_embeddings`        | `True`           | Run phase 1. Set `False` for a frozen-backbone baseline. |
-| `embedding_num_epochs`    | `1`              | Epochs over contrastive pairs.                           |
-| `embedding_batch_size`    | `16`             | Pair batch size (lower it if you hit memory limits).     |
-| `body_learning_rate`      | `2e-5`           | LR for the audio body.                                   |
-| `loss`                    | `"cosine"`       | `"cosine"` or `"contrastive"` (or pass an `nn.Module`).  |
-| `sampling_strategy`       | `"oversampling"` | `"unique"` / `"oversampling"` / `"undersampling"`.       |
-| `max_steps` / `max_pairs` | `-1`             | Cap phase-1 work (handy on CPU/laptops).                 |
-| `classifier_num_epochs`   | `25`             | Torch-head epochs (ignored for sklearn head).            |
+| Argument                  | Default          | Purpose                                                                                   |
+| ------------------------- | ---------------- | ----------------------------------------------------------------------------------------- |
+| `train_embeddings`        | `True`           | Run phase 1. Set `False` for a frozen-backbone baseline.                                  |
+| `embedding_num_epochs`    | `1`              | Epochs over contrastive pairs.                                                            |
+| `embedding_batch_size`    | `16`             | Pair batch size (lower it if you hit memory limits).                                      |
+| `body_learning_rate`      | `2e-5`           | LR for the audio body.                                                                    |
+| `loss`                    | `"cosine"`       | `"cosine"` / `"contrastive"` (pairwise) or `"supcon"` (in-batch); or pass an `nn.Module`. |
+| `sampling_strategy`       | `"oversampling"` | `"unique"` / `"oversampling"` / `"undersampling"` (pairwise path).                        |
+| `samples_per_class`       | `2`              | Examples/class per batch for the `"supcon"` group-by-label sampler.                       |
+| `supcon_temperature`      | `0.07`           | Softmax temperature for `"supcon"`.                                                       |
+| `max_steps` / `max_pairs` | `-1`             | Cap phase-1 work (handy on CPU/laptops).                                                  |
+| `classifier_num_epochs`   | `25`             | Torch-head epochs (ignored for sklearn head).                                             |
 
+
+> **Two contrastive paths.** `"cosine"`/`"contrastive"` are *pairwise* losses (a batch is a list of
+> same/different-label pairs). `"supcon"` is an *in-batch* loss: the `Trainer` switches to a
+> group-by-label sampler (`samples_per_class` per class) so every batch has positives and negatives,
+> and larger `embedding_batch_size` adds more negatives. In our sweep `supcon` (batch 32) was the
+> strongest, most stable speech configuration, so the speech examples default to it; benchmark it
+> head-to-head with `python examples/benchmark.py --dataset mswc --seeds 41 42 43 --losses frozen cosine supcon`.
 
 ## Backbones
 
@@ -241,22 +289,26 @@ encoders._ENCODER_REGISTRY["my_model_type"] = MyEncoder
 ## Roadmap / next steps
 
 **Benchmarking & evaluation**
+
 - [x] Reproducible multi-backbone / multi-seed benchmark harness (`examples/benchmark.py`) with mean ± std tables.
 - [x] Richer metrics in `Trainer.evaluate` (accuracy + macro-F1); per-class accuracy and confusion matrix via `Trainer.classification_report`.
-- [ ] Published results table (CLAP vs wav2vec2 vs WavLM across all example datasets).
+- [x] Published results table (CLAP vs WavLM across all example datasets) + one-command sweep (`examples/sweep.sh`).
 
 **Training method**
-- [ ] `SupConLoss` / InfoNCE with in-batch negatives + group-by-label batch sampler (so larger batches add real negatives, as in SetFit).
+
+- [x] `SupConLoss` with in-batch negatives + group-by-label batch sampler (so larger batches add real negatives, as in SetFit). Enable with `loss="supcon"`.
 - [ ] Audio augmentation for the few-shot regime (SpecAugment, additive noise, gain, time-shift, random crop).
 - [ ] Embedding cache for the frozen-backbone path (skip re-encoding clips across runs/sweeps).
 - [ ] Knowledge distillation from a large unlabeled audio pool (teacher → student).
 
 **Models & inputs**
+
 - [ ] Long-clip handling: windowing/chunking → encode → pool/vote.
 - [ ] Multilabel audio tagging end-to-end example (sampler already supports multilabel pairs).
 - [ ] (Optional) BEATs / OpenBEATs backbone (strongest general-purpose SSL embeddings).
 
 **Productionization**
+
 - [ ] ONNX / `torch.compile` export for fast CPU inference.
 - [ ] Hub `push_to_hub` with an auto-generated model card (incl. the eval table).
 - [ ] Smoke-test suite + CI using small real models (e.g. `openai/whisper-tiny`).

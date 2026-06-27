@@ -6,13 +6,17 @@ SUPERB KS task: each clip is a single spoken word, and the label is which word i
 strong default -- a nice contrast to the semantic sound-event tasks (ESC-50, UrbanSound8K).
 
 The English config has 271 keywords with predefined train/validation/test splits; this script
-restricts to a handful of keywords for a fast few-shot run.
+restricts to a handful of keywords for a fast few-shot run. By default it uses the most
+*frequent* keywords (well-populated, near-balanced test split) and the in-batch ``supcon`` loss,
+which was the strongest speech configuration in our sweep.
 
 Examples:
-    python examples/train_mswc_keywords.py                       # 10 keywords, wav2vec2-base
+    python examples/train_mswc_keywords.py                       # 10 keywords, wav2vec2-base, supcon
     python examples/train_mswc_keywords.py --classes 5 --num-samples 16
     python examples/train_mswc_keywords.py --language spanish
     python examples/train_mswc_keywords.py --backbone laion/clap-htsat-unfused   # compare vs CLAP
+    python examples/train_mswc_keywords.py --keyword-selection alphabetical      # legacy selection
+    python examples/train_mswc_keywords.py --loss cosine --batch-size 8          # pairwise baseline
     python examples/train_mswc_keywords.py --no-embedding-finetuning             # frozen baseline
 """
 
@@ -28,9 +32,16 @@ def parse_args():
     p.add_argument("--backbone", default="facebook/wav2vec2-base", help="HF audio backbone id")
     p.add_argument("--language", default="english", help="MSWC config: english / indian / spanish")
     p.add_argument("--classes", type=int, default=10, help="Number of keywords to use")
+    p.add_argument(
+        "--keyword-selection",
+        choices=["frequent", "alphabetical"],
+        default="frequent",
+        help="Which keywords to use: the most frequent ones (well-populated, balanced eval) "
+        "or the alphabetically-first ones (legacy; mostly rare proper nouns).",
+    )
     p.add_argument("--num-samples", type=int, default=8, help="Labeled examples per class (few-shot)")
     p.add_argument("--epochs", type=int, default=1, help="Embedding fine-tuning epochs")
-    p.add_argument("--batch-size", type=int, default=8, help="Embedding (pair) batch size")
+    p.add_argument("--batch-size", type=int, default=32, help="Embedding (pair/group) batch size")
     p.add_argument("--max-steps", type=int, default=-1, help="Cap phase-1 optimizer steps (-1 = no cap)")
     p.add_argument("--eval-size", type=int, default=120, help="Max eval clips (for speed)")
     p.add_argument("--no-embedding-finetuning", action="store_true", help="Skip phase 1 (frozen backbone)")
@@ -38,6 +49,8 @@ def parse_args():
     p.add_argument("--device", default=None, help="cpu / cuda / mps (auto if omitted)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-pairs", type=int, default=256, help="Cap total contrastive pairs (-1 = no cap)")
+    p.add_argument("--loss", default="supcon", help="Phase-1 loss: cosine / contrastive / supcon")
+    p.add_argument("--samples-per-class", type=int, default=2, help="Examples per class per batch (supcon path)")
     p.add_argument("--num-workers", type=int, default=0, help="DataLoader workers for phase 1.")
     return p.parse_args()
 
@@ -57,8 +70,20 @@ def main():
         test_set = test_set.remove_columns("label")
 
     # Pick a deterministic subset of keywords for a fast local run.
-    selected = sorted(set(train_pool["keyword"]))[: args.classes]
-    print(f"Using {len(selected)} keywords: {selected}")
+    #
+    # MSWC's keyword distribution is extremely long-tailed (a few words have thousands of
+    # clips, most have a handful). Selecting alphabetically lands on rare proper nouns whose
+    # test split has only 1-3 clips per class, which makes macro-F1 collapse while accuracy
+    # stays high (it is dominated by the 2-3 well-populated classes). Defaulting to the most
+    # *frequent* keywords gives a well-populated, near-balanced eval set and a meaningful task.
+    if args.keyword_selection == "frequent":
+        from collections import Counter
+
+        counts = Counter(train_pool["keyword"])
+        selected = sorted(k for k, _ in counts.most_common(args.classes))
+    else:
+        selected = sorted(set(train_pool["keyword"]))[: args.classes]
+    print(f"Using {len(selected)} keywords ({args.keyword_selection}): {selected}")
     train_pool = train_pool.filter(lambda k: k in selected, input_columns="keyword")
     test_set = test_set.filter(lambda k: k in selected, input_columns="keyword")
 
@@ -88,7 +113,8 @@ def main():
         max_steps=args.max_steps,
         seed=args.seed,
         sampling_strategy="oversampling",
-        loss="cosine",
+        loss=args.loss,
+        samples_per_class=args.samples_per_class,
         num_workers=args.num_workers,
         max_pairs=args.max_pairs,
     )
