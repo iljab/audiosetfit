@@ -36,7 +36,7 @@ def parse_args():
     p.add_argument("--classes", type=int, default=6, help="Number of emotions to use (<=6)")
     p.add_argument("--num-samples", type=int, default=8, help="Labeled examples per class (few-shot)")
     p.add_argument("--epochs", type=int, default=1, help="Embedding fine-tuning epochs")
-    p.add_argument("--batch-size", type=int, default=8, help="Embedding (pair) batch size")
+    p.add_argument("--batch-size", type=int, default=32, help="Embedding (pair/group) batch size")
     p.add_argument("--max-steps", type=int, default=-1, help="Cap phase-1 optimizer steps (-1 = no cap)")
     p.add_argument("--eval-size", type=int, default=80, help="Max eval clips (for speed)")
     p.add_argument(
@@ -50,7 +50,7 @@ def parse_args():
     p.add_argument("--device", default=None, help="cpu / cuda / mps (auto if omitted)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-pairs", type=int, default=256, help="Cap total contrastive pairs (-1 = no cap)")
-    p.add_argument("--loss", default="cosine", help="Phase-1 loss: cosine / contrastive / supcon")
+    p.add_argument("--loss", default="supcon", help="Phase-1 loss: cosine / contrastive / supcon")
     p.add_argument("--samples-per-class", type=int, default=2, help="Examples per class per batch (supcon path)")
     p.add_argument(
         "--num-workers",

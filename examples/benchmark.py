@@ -199,6 +199,8 @@ def main():
             )
 
     if args.csv:
+        parent = os.path.dirname(os.path.abspath(args.csv))
+        os.makedirs(parent, exist_ok=True)
         with open(args.csv, "w", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=["backbone", "loss", "bs", "seed", "accuracy", "f1_macro"])
             writer.writeheader()

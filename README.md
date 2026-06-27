@@ -85,14 +85,16 @@ python examples/train_cremad.py --backbone laion/clap-htsat-unfused   # compare 
 
 A **keyword-spotting** example (SUPERB KS-style) on
 [MSWC](https://huggingface.co/datasets/confit/mswc-parquet) (Multilingual Spoken Words Corpus).
-Each clip is a single spoken word; this is a lexical/phonetic task, so it also defaults to a
-speech encoder and uses the dataset's predefined train/test splits:
+Each clip is a single spoken word; this is a lexical/phonetic task, so it defaults to a speech
+encoder, the in-batch `supcon` loss, and the **most frequent** keywords (MSWC is long-tailed, so
+selecting alphabetically yields rare words with only 1-3 test clips and a misleading macro-F1):
 
 ```bash
-python examples/train_mswc_keywords.py                  # 10 keywords, wav2vec2-base
+python examples/train_mswc_keywords.py                  # 10 frequent keywords, wav2vec2-base, supcon
 python examples/train_mswc_keywords.py --classes 5 --num-samples 16
 python examples/train_mswc_keywords.py --language spanish
-python examples/train_mswc_keywords.py --backbone laion/clap-htsat-unfused   # compare vs CLAP
+python examples/train_mswc_keywords.py --keyword-selection alphabetical       # legacy selection
+python examples/train_mswc_keywords.py --backbone laion/clap-htsat-unfused    # compare vs CLAP
 ```
 
 ### Benchmarking (multi-backbone / multi-seed)
@@ -114,6 +116,36 @@ python examples/benchmark.py --dataset mswc \
 # Forward extra flags to the training script after a literal `--`
 python examples/benchmark.py --dataset esc50 --seeds 41 42 43 -- --no-embedding-finetuning
 ```
+
+### Benchmark results
+
+Mean over 3 seeds, 8 shots/class, sklearn head. `frozen` = no phase-1 fine-tuning; `cosine`/`supcon`
+are the best batch size found per dataset. Sound-event tasks use CLAP; speech tasks use WavLM.
+Reproduce with `bash examples/sweep.sh`.
+
+| Dataset | Backbone | Frozen (acc / F1) | Cosine (acc / F1) | SupCon (acc / F1) |
+| --- | --- | --- | --- | --- |
+| **MSWC** (keyword) | `wavlm-base-plus` | 0.637 / 0.372 | 0.799 / 0.570 | **0.850** / 0.507 |
+| **CREMA-D** (emotion) | `wavlm-base-plus` | 0.288 / 0.255 | 0.313 / 0.265 | **0.321** / **0.288** |
+| **ESC-50** (sound) | `clap-htsat-unfused` | 0.988 / 0.977 | 0.988 / 0.977 | **0.996** / **0.996** |
+| **UrbanSound8K** (sound) | `clap-htsat-unfused` | 0.846 / 0.852 | **0.858** / **0.867** | 0.850 / 0.862 |
+
+Takeaways:
+
+- **Fine-tuning pays off where the frozen embedding has headroom and the backbone fits the task.**
+  On MSWC, contrastive fine-tuning lifts accuracy from 0.64 → **0.85** (+21 pts). On ESC-50, CLAP is
+  already at ceiling (0.99), so there is nothing to gain.
+- **`supcon` is the strongest, most stable contrastive objective**, and it *improves with batch size*
+  (more in-batch negatives): on MSWC, `supcon` accuracy rises 0.81 → 0.85 and variance shrinks going
+  from batch 8 → 32. Pairwise `cosine` does the opposite (it degrades at larger batches). Hence the
+  speech examples default to `--loss supcon --batch-size 32`.
+- **Accuracy vs macro-F1 gaps are usually an eval-set artifact, not a model issue.** The earlier MSWC
+  gap (acc 0.85 / F1 0.51) came from picking keywords *alphabetically* (rare proper nouns with 1-3
+  test clips each). The example now selects the **most frequent** keywords by default
+  (`--keyword-selection frequent`), giving a well-populated, near-balanced test split where the two
+  metrics track each other. (For genuinely imbalanced *training* pools, pass a class-weighted head via
+  `from_pretrained(..., head_params={"class_weight": "balanced"})`; it is a no-op when training is
+  already balanced by `sample_dataset`.)
 
 ### Minimal end-to-end usage
 
@@ -166,6 +198,7 @@ examples/train_urbansound8k.py
 examples/train_cremad.py
 examples/train_mswc_keywords.py
 examples/benchmark.py            # multi-backbone / multi-seed harness
+examples/sweep.sh                # full loss x batch-size x seed sweep across all datasets
 ```
 
 ## Key training arguments
@@ -187,8 +220,9 @@ examples/benchmark.py            # multi-backbone / multi-seed harness
 > **Two contrastive paths.** `"cosine"`/`"contrastive"` are *pairwise* losses (a batch is a list of
 > same/different-label pairs). `"supcon"` is an *in-batch* loss: the `Trainer` switches to a
 > group-by-label sampler (`samples_per_class` per class) so every batch has positives and negatives,
-> and larger `embedding_batch_size` adds more negatives. Benchmark it head-to-head, e.g.
-> `python examples/benchmark.py --dataset mswc --seeds 41 42 43 -- --loss supcon`.
+> and larger `embedding_batch_size` adds more negatives. In our sweep `supcon` (batch 32) was the
+> strongest, most stable speech configuration, so the speech examples default to it; benchmark it
+> head-to-head with `python examples/benchmark.py --dataset mswc --seeds 41 42 43 --losses frozen cosine supcon`.
 
 
 ## Backbones
@@ -251,7 +285,7 @@ encoders._ENCODER_REGISTRY["my_model_type"] = MyEncoder
 **Benchmarking & evaluation**
 - [x] Reproducible multi-backbone / multi-seed benchmark harness (`examples/benchmark.py`) with mean ± std tables.
 - [x] Richer metrics in `Trainer.evaluate` (accuracy + macro-F1); per-class accuracy and confusion matrix via `Trainer.classification_report`.
-- [ ] Published results table (CLAP vs wav2vec2 vs WavLM across all example datasets).
+- [x] Published results table (CLAP vs WavLM across all example datasets) + one-command sweep (`examples/sweep.sh`).
 
 **Training method**
 - [x] `SupConLoss` with in-batch negatives + group-by-label batch sampler (so larger batches add real negatives, as in SetFit). Enable with `loss="supcon"`.
