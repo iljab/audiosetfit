@@ -5,6 +5,9 @@ reported eval metrics, and prints a mean +/- std table. Because it simply drives
 ``examples/train_*.py`` scripts as subprocesses, each dataset keeps its own split logic
 (ESC-50/UrbanSound8K folds, CREMA-D speaker-disjoint, MSWC predefined splits).
 
+It can also sweep a grid of training conditions in one invocation via ``--losses`` and
+``--batch-sizes``; results are grouped per (backbone, loss, batch-size).
+
 Examples:
     # CLAP vs wav2vec2 on CREMA-D over 3 seeds
     python examples/benchmark.py --dataset cremad \
@@ -15,6 +18,10 @@ Examples:
     python examples/benchmark.py --dataset mswc \
         --backbones facebook/wav2vec2-base microsoft/wavlm-base \
         --seeds 42 43 --csv results.csv
+
+    # Loss/batch-size grid: frozen vs cosine vs supcon (large batch) on MSWC
+    python examples/benchmark.py --dataset mswc --backbones microsoft/wavlm-base \
+        --seeds 41 42 43 --losses frozen cosine supcon --batch-sizes 8 32
 
     # Frozen-backbone baseline (pass-through flag after `--`)
     python examples/benchmark.py --dataset esc50 --seeds 41 42 43 -- --no-embedding-finetuning
@@ -51,6 +58,20 @@ def parse_args():
     p.add_argument("--dataset", choices=sorted(DATASET_SCRIPTS), required=True, help="Which example to run")
     p.add_argument("--backbones", nargs="+", default=DEFAULT_BACKBONES, help="HF backbone ids to compare")
     p.add_argument("--seeds", nargs="+", type=int, default=[42], help="Seeds to average over")
+    p.add_argument(
+        "--losses",
+        nargs="+",
+        default=None,
+        help="Grid over phase-1 losses, e.g. 'cosine supcon frozen' "
+        "('frozen' maps to --no-embedding-finetuning).",
+    )
+    p.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Grid over --batch-size values (supcon benefits from larger batches).",
+    )
     p.add_argument("--device", default=None, help="cpu / cuda / mps (auto if omitted)")
     p.add_argument("--csv", default=None, help="Optional path to write per-run results as CSV")
     p.add_argument("--quiet", action="store_true", help="Suppress each run's stdout (still parses metrics)")
@@ -67,14 +88,14 @@ def _clean_passthrough(passthrough: List[str]) -> List[str]:
     return passthrough[1:] if passthrough and passthrough[0] == "--" else passthrough
 
 
-def run_one(script: str, backbone: str, seed: int, device: Optional[str], extra: List[str], quiet: bool):
+def run_one(script: str, backbone: str, seed: int, device: Optional[str], extra: List[str], quiet: bool, tag: str = ""):
     """Run a single training script and return its parsed metrics dict (or None on failure)."""
     cmd = [sys.executable, script, "--backbone", backbone, "--seed", str(seed)]
     if device:
         cmd += ["--device", device]
     cmd += extra
 
-    print(f"\n>>> {backbone} | seed={seed}")
+    print(f"\n>>> {backbone} | seed={seed}{(' | ' + tag) if tag else ''}")
     print("    " + " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if not quiet and proc.stdout:
@@ -104,41 +125,82 @@ def aggregate(values: List[float]) -> Tuple[float, float]:
     return mean, std
 
 
+# A condition is one cell of the loss x batch-size grid: a label plus the extra CLI args it adds.
+FROZEN_TOKENS = {"frozen", "none", "no-ft"}
+
+
+def expand_conditions(args, base_extra: List[str]) -> List[Dict]:
+    """Cartesian product of --losses x --batch-sizes, each as (loss, bs, extra-args)."""
+    losses = args.losses if args.losses else [None]
+    batch_sizes = args.batch_sizes if args.batch_sizes else [None]
+    conditions: List[Dict] = []
+    for loss in losses:
+        for bs in batch_sizes:
+            extra = list(base_extra)
+            if loss is None:
+                loss_label = "default"
+            elif loss.lower() in FROZEN_TOKENS:
+                extra += ["--no-embedding-finetuning"]
+                loss_label = "frozen"
+            else:
+                extra += ["--loss", loss]
+                loss_label = loss
+            if bs is not None:
+                extra += ["--batch-size", str(bs)]
+            conditions.append({"loss": loss_label, "bs": ("-" if bs is None else str(bs)), "extra": extra})
+    return conditions
+
+
 def main():
     args = parse_args()
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), DATASET_SCRIPTS[args.dataset])
-    extra = _clean_passthrough(args.passthrough)
+    base_extra = _clean_passthrough(args.passthrough)
+    conditions = expand_conditions(args, base_extra)
 
-    rows: List[Dict] = []  # one per (backbone, seed)
+    rows: List[Dict] = []  # one per (backbone, condition, seed)
     for backbone in args.backbones:
-        for seed in args.seeds:
-            metrics = run_one(script, backbone, seed, args.device, extra, args.quiet)
-            row = {"backbone": backbone, "seed": seed}
-            if metrics:
-                row["accuracy"] = metrics.get("test_accuracy")
-                row["f1_macro"] = metrics.get("test_f1_macro")
-            rows.append(row)
+        for cond in conditions:
+            for seed in args.seeds:
+                tag = f"loss={cond['loss']} bs={cond['bs']}"
+                metrics = run_one(script, backbone, seed, args.device, cond["extra"], args.quiet, tag=tag)
+                row = {"backbone": backbone, "loss": cond["loss"], "bs": cond["bs"], "seed": seed}
+                if metrics:
+                    row["accuracy"] = metrics.get("test_accuracy")
+                    row["f1_macro"] = metrics.get("test_f1_macro")
+                rows.append(row)
 
-    # ---- summary table (mean +/- std over seeds, per backbone) ----
-    print("\n" + "=" * 72)
-    print(f"Benchmark: {args.dataset}  |  seeds={args.seeds}  |  args={extra or '(defaults)'}")
-    print("=" * 72)
-    header = f"{'backbone':45s} {'accuracy':>16s} {'f1_macro':>16s} {'n':>4s}"
+    # ---- summary table (mean +/- std over seeds, per backbone x condition) ----
+    print("\n" + "=" * 86)
+    grid = f"losses={args.losses or '(script default)'}  batch_sizes={args.batch_sizes or '(script default)'}"
+    print(f"Benchmark: {args.dataset}  |  seeds={args.seeds}  |  {grid}")
+    if base_extra:
+        print(f"           extra args: {base_extra}")
+    print("=" * 86)
+    header = f"{'backbone':38s} {'loss':>8s} {'bs':>4s} {'accuracy':>16s} {'f1_macro':>16s} {'n':>3s}"
     print(header)
     print("-" * len(header))
     for backbone in args.backbones:
-        accs = [r["accuracy"] for r in rows if r["backbone"] == backbone and r.get("accuracy") is not None]
-        f1s = [r["f1_macro"] for r in rows if r["backbone"] == backbone and r.get("f1_macro") is not None]
-        if not accs:
-            print(f"{backbone:45s} {'FAILED':>16s} {'FAILED':>16s} {0:>4d}")
-            continue
-        a_m, a_s = aggregate(accs)
-        f_m, f_s = aggregate(f1s) if f1s else (float("nan"), 0.0)
-        print(f"{backbone:45s} {a_m:7.4f} +/-{a_s:5.4f} {f_m:7.4f} +/-{f_s:5.4f} {len(accs):>4d}")
+        for cond in conditions:
+            sel = [
+                r for r in rows
+                if r["backbone"] == backbone and r["loss"] == cond["loss"] and r["bs"] == cond["bs"]
+            ]
+            accs = [r["accuracy"] for r in sel if r.get("accuracy") is not None]
+            f1s = [r["f1_macro"] for r in sel if r.get("f1_macro") is not None]
+            name = backbone if len(backbone) <= 38 else backbone[:37] + "\u2026"
+            if not accs:
+                print(f"{name:38s} {cond['loss']:>8s} {cond['bs']:>4s} {'FAILED':>16s} {'FAILED':>16s} {0:>3d}")
+                continue
+            a_m, a_s = aggregate(accs)
+            f_m, f_s = aggregate(f1s) if f1s else (float("nan"), 0.0)
+            print(
+                f"{name:38s} {cond['loss']:>8s} {cond['bs']:>4s} "
+                f"{a_m:7.4f} +/-{a_s:5.4f} {f_m:7.4f} +/-{f_s:5.4f} {len(accs):>3d}"
+            )
 
     if args.csv:
         with open(args.csv, "w", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=["backbone", "seed", "accuracy", "f1_macro"])
+            writer = csv.DictWriter(fh, fieldnames=["backbone", "loss", "bs", "seed", "accuracy", "f1_macro"])
             writer.writeheader()
             for r in rows:
                 writer.writerow({k: r.get(k) for k in writer.fieldnames})

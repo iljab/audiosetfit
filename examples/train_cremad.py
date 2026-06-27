@@ -50,6 +50,8 @@ def parse_args():
     p.add_argument("--device", default=None, help="cpu / cuda / mps (auto if omitted)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-pairs", type=int, default=256, help="Cap total contrastive pairs (-1 = no cap)")
+    p.add_argument("--loss", default="cosine", help="Phase-1 loss: cosine / contrastive / supcon")
+    p.add_argument("--samples-per-class", type=int, default=2, help="Examples per class per batch (supcon path)")
     p.add_argument(
         "--num-workers",
         type=int,
@@ -110,7 +112,8 @@ def main():
         max_steps=args.max_steps,
         seed=args.seed,
         sampling_strategy="oversampling",
-        loss="cosine",
+        loss=args.loss,
+        samples_per_class=args.samples_per_class,
         num_workers=args.num_workers,
         max_pairs=args.max_pairs,
     )

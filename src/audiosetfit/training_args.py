@@ -16,6 +16,9 @@ class TrainingArguments:
         embedding_num_epochs, embedding_batch_size, body_learning_rate, loss, margin,
         sampling_strategy, num_iterations, max_steps, max_pairs, warmup_proportion, l2_weight.
 
+        For the in-batch ``loss="supcon"`` path: samples_per_class and supcon_temperature
+        control batch composition (a group-by-label sampler) and the softmax temperature.
+
     Phase 2 (classifier head):
         classifier_num_epochs, classifier_batch_size, head_learning_rate, end_to_end.
 
@@ -35,6 +38,9 @@ class TrainingArguments:
     margin: float = 0.5
     sampling_strategy: str = "oversampling"
     num_iterations: Optional[int] = None
+    # in-batch (supcon) path: batch composition + temperature
+    samples_per_class: int = 2
+    supcon_temperature: float = 0.07
     max_steps: int = -1
     max_pairs: int = -1
     warmup_proportion: float = 0.1

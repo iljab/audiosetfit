@@ -157,7 +157,7 @@ src/audiosetfit/
 ├── encoders.py      # AudioEncoder base + CLAP/AST/wav2vec2-family/Whisper + build_encoder()
 ├── modeling.py      # AudioSetFitModel, AudioSetFitHead, save/from_pretrained
 ├── sampler.py       # ContrastiveDataset (same/different-label pair generation)
-├── losses.py        # CosineSimilarityLoss, ContrastiveLoss (on embedding tensors)
+├── losses.py        # CosineSimilarityLoss, ContrastiveLoss, SupConLoss (on embedding tensors)
 ├── data.py          # load_audio (resampling), sample_dataset
 ├── training_args.py # TrainingArguments (both phases)
 └── trainer.py       # self-contained two-phase Trainer
@@ -177,10 +177,18 @@ examples/benchmark.py            # multi-backbone / multi-seed harness
 | `embedding_num_epochs`    | `1`              | Epochs over contrastive pairs.                           |
 | `embedding_batch_size`    | `16`             | Pair batch size (lower it if you hit memory limits).     |
 | `body_learning_rate`      | `2e-5`           | LR for the audio body.                                   |
-| `loss`                    | `"cosine"`       | `"cosine"` or `"contrastive"` (or pass an `nn.Module`).  |
-| `sampling_strategy`       | `"oversampling"` | `"unique"` / `"oversampling"` / `"undersampling"`.       |
+| `loss`                    | `"cosine"`       | `"cosine"` / `"contrastive"` (pairwise) or `"supcon"` (in-batch); or pass an `nn.Module`. |
+| `sampling_strategy`       | `"oversampling"` | `"unique"` / `"oversampling"` / `"undersampling"` (pairwise path).       |
+| `samples_per_class`       | `2`              | Examples/class per batch for the `"supcon"` group-by-label sampler.       |
+| `supcon_temperature`      | `0.07`           | Softmax temperature for `"supcon"`.                      |
 | `max_steps` / `max_pairs` | `-1`             | Cap phase-1 work (handy on CPU/laptops).                 |
 | `classifier_num_epochs`   | `25`             | Torch-head epochs (ignored for sklearn head).            |
+
+> **Two contrastive paths.** `"cosine"`/`"contrastive"` are *pairwise* losses (a batch is a list of
+> same/different-label pairs). `"supcon"` is an *in-batch* loss: the `Trainer` switches to a
+> group-by-label sampler (`samples_per_class` per class) so every batch has positives and negatives,
+> and larger `embedding_batch_size` adds more negatives. Benchmark it head-to-head, e.g.
+> `python examples/benchmark.py --dataset mswc --seeds 41 42 43 -- --loss supcon`.
 
 
 ## Backbones
@@ -246,7 +254,7 @@ encoders._ENCODER_REGISTRY["my_model_type"] = MyEncoder
 - [ ] Published results table (CLAP vs wav2vec2 vs WavLM across all example datasets).
 
 **Training method**
-- [ ] `SupConLoss` / InfoNCE with in-batch negatives + group-by-label batch sampler (so larger batches add real negatives, as in SetFit).
+- [x] `SupConLoss` with in-batch negatives + group-by-label batch sampler (so larger batches add real negatives, as in SetFit). Enable with `loss="supcon"`.
 - [ ] Audio augmentation for the few-shot regime (SpecAugment, additive noise, gain, time-shift, random crop).
 - [ ] Embedding cache for the frozen-backbone path (skip re-encoding clips across runs/sweeps).
 - [ ] Knowledge distillation from a large unlabeled audio pool (teacher → student).

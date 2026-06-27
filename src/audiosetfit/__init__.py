@@ -15,7 +15,7 @@ from .encoders import (
     WhisperEncoder,
     build_encoder,
 )
-from .losses import ContrastiveLoss, CosineSimilarityLoss, get_loss
+from .losses import ContrastiveLoss, CosineSimilarityLoss, SupConLoss, get_loss
 from .modeling import AudioSetFitHead, AudioSetFitModel
 from .sampler import ContrastiveDataset
 from .trainer import Trainer
@@ -38,5 +38,6 @@ __all__ = [
     "build_encoder",
     "CosineSimilarityLoss",
     "ContrastiveLoss",
+    "SupConLoss",
     "get_loss",
 ]
